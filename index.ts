@@ -1,7 +1,8 @@
 import express from "express";
-import { Status, StatusOpen, ResponseEnded } from "hyper-ts";
+import { Status, HeadersOpen, StatusOpen, ResponseEnded } from "hyper-ts";
 import * as E from "fp-ts/Either";
 import * as M from "hyper-ts/lib/Middleware";
+import * as R from "hyper-ts/lib/ReaderMiddleware";
 import { toRequestHandler } from "hyper-ts/lib/express";
 import { pipe } from "fp-ts/function";
 import * as t from "io-ts";
@@ -16,19 +17,13 @@ const QueryParams = t.strict({
 
 type Query = t.TypeOf<typeof QueryParams>;
 
-interface Ctx {
-  query: Query;
-  requestId: string;
-}
-
-const queryDecoder = M.decodeQuery((q) =>
+const queryDecoder = (u: unknown) =>
   pipe(
-    QueryParams.decode(q),
+    QueryParams.decode(u),
     E.mapLeft(
       (errors) => `Invalid query parameters:\n${failure(errors).join("\n")}`
     )
-  )
-);
+  );
 
 const withDefault = (value: unknown): E.Either<never, string> =>
   pipe(
@@ -36,46 +31,41 @@ const withDefault = (value: unknown): E.Either<never, string> =>
     E.orElse(() => E.right(uuidv4()))
   );
 
-const ageValidation = (ctx: Ctx) => {
-  const either = ctx.query.age > 41 ? E.left("too old!") : E.right(ctx);
-  return M.fromEither(either);
-};
+const ageValidation = (query: Query) =>
+  pipe(query.age > 41 ? E.left("too old!") : E.right(query), R.fromEither);
 
-interface ErrorCtx {
-  message: string;
-  requestId: string;
-}
-
-function badRequest(
-  ctx: ErrorCtx
-): M.Middleware<StatusOpen, ResponseEnded, never, void> {
-  return pipe(
-    M.status(Status.BadRequest),
-    M.ichain(() => M.header("X-Request-Id", ctx.requestId)),
-    M.ichain(() => M.closeHeaders()),
-    M.ichain(() => M.send(ctx.message))
-  );
-}
-
-const greenPath = (ctx: Ctx) =>
+const greenPath = (
+  query: Query
+): R.ReaderMiddleware<string, StatusOpen, ResponseEnded, string, void> =>
   pipe(
-    M.status<string>(Status.OK),
-    M.ichain(() => M.header("X-Request-Id", ctx.requestId)),
-    M.ichain(() => M.closeHeaders()),
-    M.ichain(() => M.send(`Hello ${ctx.query.name}!`))
+    R.status<string>(Status.OK),
+    R.ichain(() => R.ask<string, HeadersOpen>()),
+    R.ichain((requestId) => R.header("X-Request-Id", requestId)),
+    R.ichain(() => R.closeHeaders()),
+    R.ichain(() => R.send(`Hello ${query.name}!`))
   );
+
+const badRequest = (
+  message: string
+): R.ReaderMiddleware<string, StatusOpen, ResponseEnded, never, void> =>
+  pipe(
+    R.status(Status.BadRequest),
+    R.ichain(() => R.ask<string, HeadersOpen>()),
+    R.ichain((requestId) => R.header("X-Request-Id", requestId)),
+    R.ichain(() => R.closeHeaders()),
+    R.ichain(() => R.send(message))
+  );
+
+const withRequestId = pipe(
+  R.decodeQuery(queryDecoder),
+  R.ichain(ageValidation),
+  R.ichain(greenPath),
+  R.orElse(badRequest)
+);
 
 const hello = pipe(
   M.decodeHeader("x-request-id", withDefault),
-  M.ichain((requestId: string) =>
-    pipe(
-      queryDecoder,
-      M.map((query) => ({ query, requestId })),
-      M.ichain(ageValidation),
-      M.ichain(greenPath),
-      M.orElse((message) => badRequest({ message, requestId }))
-    )
-  )
+  M.ichain(withRequestId)
 );
 
 express()
