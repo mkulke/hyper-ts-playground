@@ -9,11 +9,19 @@ import * as t from "io-ts";
 import { failure } from "io-ts/lib/PathReporter";
 import { IntFromString } from "io-ts-types/lib/IntFromString";
 import { v4 as uuidv4 } from "uuid";
+import { Todo, getTodo } from "./service";
 
 const QueryParams = t.strict({
   name: t.string,
   age: IntFromString,
 });
+
+type ReaderMW<
+  R,
+  I = StatusOpen,
+  O = StatusOpen,
+  E = string
+> = R.ReaderMiddleware<string, I, O, E, R>;
 
 type Query = t.TypeOf<typeof QueryParams>;
 
@@ -34,20 +42,28 @@ const withDefault = (value: unknown): E.Either<never, string> =>
 const ageValidation = (query: Query) =>
   pipe(query.age > 41 ? E.left("too old!") : E.right(query), R.fromEither);
 
-const greenPath = (
-  query: Query
-): R.ReaderMiddleware<string, StatusOpen, ResponseEnded, string, void> =>
+const ok = (response: string): ReaderMW<void, StatusOpen, ResponseEnded> =>
   pipe(
     R.status<string>(Status.OK),
     R.ichain(() => R.ask<string, HeadersOpen>()),
     R.ichain((requestId) => R.header("X-Request-Id", requestId)),
     R.ichain(() => R.closeHeaders()),
-    R.ichain(() => R.send(`Hello ${query.name}!`))
+    R.ichain(() => R.send(response))
+  );
+
+const performCall = (query: Query) =>
+  pipe(
+    R.ask<string>(),
+    R.ichain(
+      (requestId): ReaderMW<Todo> => pipe(getTodo(requestId), R.fromTaskEither)
+    ),
+    R.map<Todo, string>((todo) => `Hello ${query.name}, title: ${todo.title}`),
+    R.ichain(ok)
   );
 
 const badRequest = (
   message: string
-): R.ReaderMiddleware<string, StatusOpen, ResponseEnded, never, void> =>
+): ReaderMW<void, StatusOpen, ResponseEnded, never> =>
   pipe(
     R.status(Status.BadRequest),
     R.ichain(() => R.ask<string, HeadersOpen>()),
@@ -59,7 +75,7 @@ const badRequest = (
 const withRequestId = pipe(
   R.decodeQuery(queryDecoder),
   R.ichain(ageValidation),
-  R.ichain(greenPath),
+  R.ichain(performCall),
   R.orElse(badRequest)
 );
 
